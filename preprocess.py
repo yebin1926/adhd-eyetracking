@@ -16,19 +16,21 @@ Details:
 preprocess.py
 - Load raw eye-tracking CSVs
 - Dynamic segmentation using Win + C3 cost
-- Extract PI features per segment (target: 444 features/segment)
-- Save cached per-student arrays to .npz
+- Extract PI feature vectors per segment (444)
+- Save per-student cached .npz containing:
+    X: (num_segments, 444)
+    y: int in {0,1,2,3}
+    seg_start_s, seg_end_s: segment boundaries in seconds (relative)
+    metadata: client_id, group_label, test_type, screen_w, screen_h, etc.
 
-Expected directory structure (root_dir):
-  {date}/{client_id}/{test_type}/eye-tracking/{other_id}/eye-tracking.csv
+Changes requested:
+1) Excel path is passed as argument (--pi_excel)
+2) PI extraction module path is fixed (no argument)
+3) Added fixed-window segmentation option with minimal changes:
+   --segmentation {dynamic,fixed}
+   --fixed_win_s, --fixed_stride_s, --fixed_drop_last
 
-Labels CSV (example):
-  /data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv
-
-PI extractor is fixed at:
-  /data_248/pdss/primitive_indicator_scripts/scripts/intern/extract_eye_tracking_pi_window.py
-
-Usage example:
+Usage example for dynamic:
   python preprocess.py \
     --root_dir /data_248/pdss/hospital_data_real \
     --label_csv /data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv \
@@ -36,52 +38,45 @@ Usage example:
     --out_dir /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output \
     --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/Primitive Indicator Lists.xlsx" \
     --pi_sheet eye-tracking
+
+Usage example for fixed:
+python preprocess.py \
+  --root_dir "/data_248/pdss/hospital_data_real" \
+  --label_csv "/data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv" \
+  --test_type dnb \
+  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/dnb_fixed_w6_s2" \
+  --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/Primitive Indicator Lists.xlsx" \
+  --pi_sheet "eye-tracking" \
+  --segmentation fixed \
+  --fixed_win_s 6 \
+  --fixed_stride_s 2 \
+  --min_segment_len_s 1
 """
+
 import argparse
+import glob
 import importlib.util
 import json
-import sys
+import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 
-# -----------------------------
-# Fixed path (per your request)
-# -----------------------------
-PI_PY_FIXED = "/data_248/pdss/primitive_indicator_scripts/scripts/intern/extract_eye_tracking_pi_window.py"
+# Fixed PI extractor path (do NOT change; per your requirement)
+PI_EXTRACTOR_PATH = Path("/data_248/pdss/primitive_indicator_scripts/scripts/intern/extract_eye_tracking_pi_window.py")
 
-# -----------------------------
-# Label mapping
-# -----------------------------
-LABEL_MAP = {
-    "Non-ADHD": 0,
-    "NonADHD": 0,
-    "Non_adhd": 0,
-    "Non-adhd": 0,
-    "non-adhd": 0,
-    "nonadhd": 0,
-    "Control": 0,
-    "CTRL": 0,
-    "Inattentive": 1,
-    "inattentive": 1,
-    "IA": 1,
-    "Combined": 2,
-    "combined": 2,
-    "CB": 2,
-    "Subclinical": 3,
-    "subclinical": 3,
-}
-
+# Default test type
 TEST_TYPE_DEFAULT = "vst"
 
 
 # -----------------------------
-# Config container
+# Config dataclasses
 # -----------------------------
 @dataclass
 class SegConfig:
@@ -92,73 +87,68 @@ class SegConfig:
     beta: Optional[float] = None         # if None -> adaptive per file
     cov_eps_base: float = 1e-6           # base eps added to covariance
     cov_eps_scale: float = 1e-3          # scale * avg_var for eps
-    local_maxima_only: bool = True
+    local_maxima_only: bool = True       # only local maxima peaks
 
 
 # -----------------------------
-# Utilities
+# Utility: dynamically import PI module from fixed path
 # -----------------------------
-def robust_mad(x: np.ndarray) -> float:
-    x = np.asarray(x)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
-        return 0.0
-    med = np.median(x)
-    return float(np.median(np.abs(x - med)) + 1e-12)
-
-
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-def load_pi_module(pi_py_path: str):
-    """Dynamically import the PI extraction module (safe for @dataclass)."""
-    import sys
-    pi_py_path = str(Path(pi_py_path).resolve())
-
-    spec = importlib.util.spec_from_file_location("pi_module_runtime", pi_py_path)
+def load_pi_module(py_path: str):
+    spec = importlib.util.spec_from_file_location("pi_mod", py_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load PI module spec from: {pi_py_path}")
-
+        raise ImportError(f"Could not load spec from {py_path}")
     mod = importlib.util.module_from_spec(spec)
-
-    # register in sys.modules BEFORE exec_module (dataclass needs it)
+    # IMPORTANT: register in sys.modules so @dataclass works inside imported module
+    import sys
     sys.modules[spec.name] = mod
-
     spec.loader.exec_module(mod)
     return mod
 
 
+# -----------------------------
+# Utility: normalize columns
+# -----------------------------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Return a clean eye-tracking DataFrame with UNIQUE columns:
-      ['timestamp', 'x', 'y']
-    Prefer filtered_x/filtered_y if present, else raw x/y.
-    Drops missing rows and sorts by timestamp.
+    Ensure df has columns: x, y, timestamp
+    Handles cases where raw has filtered_x/filtered_y.
     """
-    # strip column names
-    df = df.rename(columns={c: str(c).strip() for c in df.columns})
+    df = df.copy()
 
-    if "timestamp" not in df.columns:
-        raise ValueError("Missing required column 'timestamp' in eye-tracking CSV.")
+    # If file has headers but sometimes spaced/cased differently
+    df.columns = [str(c).strip() for c in df.columns]
 
-    ts = pd.to_numeric(df["timestamp"], errors="coerce")
-
-    # choose signal
+    # Prefer filtered_x/y if present, else x/y
     if "filtered_x" in df.columns and "filtered_y" in df.columns:
-        x = pd.to_numeric(df["filtered_x"], errors="coerce")
-        y = pd.to_numeric(df["filtered_y"], errors="coerce")
+        df["x"] = pd.to_numeric(df["filtered_x"], errors="coerce")
+        df["y"] = pd.to_numeric(df["filtered_y"], errors="coerce")
     else:
         if "x" not in df.columns or "y" not in df.columns:
-            raise ValueError("Missing required columns 'x'/'y' in eye-tracking CSV.")
-        x = pd.to_numeric(df["x"], errors="coerce")
-        y = pd.to_numeric(df["y"], errors="coerce")
+            # Sometimes files might not have headers (rare). Try to read as 6 columns.
+            # If you hit this, your CSV likely didn't have a header row.
+            raise KeyError("Missing required columns 'x'/'y' (and no filtered_x/filtered_y).")
+        df["x"] = pd.to_numeric(df["x"], errors="coerce")
+        df["y"] = pd.to_numeric(df["y"], errors="coerce")
 
-    # IMPORTANT: build a NEW df so there are NO duplicate column names
-    out = pd.DataFrame({"timestamp": ts, "x": x, "y": y}).dropna()
+    # timestamp column
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+    else:
+        # fallback to timeStamp (string ISO) if numeric timestamp missing
+        if "timeStamp" in df.columns:
+            # convert ISO to epoch ms
+            ts = pd.to_datetime(df["timeStamp"], errors="coerce")
+            df["timestamp"] = (ts.astype("int64") / 1e6)  # ms
+        else:
+            raise KeyError("Missing required timestamp column ('timestamp' or 'timeStamp').")
 
-    out = out.sort_values("timestamp").reset_index(drop=True)
-    return out
+    # Drop rows with NaNs in essential columns
+    df = df.dropna(subset=["x", "y", "timestamp"]).reset_index(drop=True)
+
+    # Sort by timestamp (critical for stable time axis)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    return df
 
 
 def infer_time_unit_and_make_seconds(ts: np.ndarray) -> np.ndarray:
@@ -174,19 +164,25 @@ def infer_time_unit_and_make_seconds(ts: np.ndarray) -> np.ndarray:
         return np.zeros_like(ts)
 
     diffs = np.diff(ts)
-    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
-    med = float(np.median(diffs)) if diffs.size else 0.0
+    diffs = diffs[np.isfinite(diffs)]
+    if diffs.size == 0:
+        return np.zeros_like(ts)
 
-    is_ms = med >= 1.0
-    if is_ms:
-        t_s = (ts - ts[0]) / 1000.0
+    med = float(np.median(diffs))
+    # If median diff is large, assume ms
+    if med >= 1.0:
+        scale = 1000.0
     else:
-        t_s = (ts - ts[0])
+        scale = 1.0
+
+    t_s = (ts - float(ts[0])) / scale
+    # ensure nondecreasing (some logs have duplicates)
+    t_s = np.maximum.accumulate(t_s)
     return t_s
 
 
 # -----------------------------
-# C3 cost (logdet + mahalanobis)
+# C3 cost + Z-score
 # -----------------------------
 def c3_cost(Y: np.ndarray, eps: float) -> float:
     """
@@ -214,25 +210,23 @@ def c3_cost(Y: np.ndarray, eps: float) -> float:
     except np.linalg.LinAlgError:
         return float("nan")
 
-    mahal = float(np.sum((Xc @ Sinv) * Xc))
-    return float(n * logdet + mahal)
+    quad = float(np.einsum("ni,ij,nj->", Xc, Sinv, Xc))
+    return float(n * logdet + quad)
 
 
-def compute_eps_from_data(Y: np.ndarray, base: float, scale: float) -> float:
+def compute_cov_eps(Y: np.ndarray, cfg: SegConfig) -> float:
     """
-    eps = base + scale * avg_var
+    eps = cfg.cov_eps_base + cfg.cov_eps_scale * avg_var
     """
     Y = np.asarray(Y, dtype=float)
     if Y.size == 0:
-        return base
-    v = np.var(Y, axis=0)
-    avg_var = float(np.mean(v)) if np.all(np.isfinite(v)) else 0.0
-    return float(base + scale * max(avg_var, 0.0))
+        return float(cfg.cov_eps_base)
+    var = np.nanvar(Y, axis=0)
+    avg_var = float(np.nanmean(var)) if np.isfinite(np.nanmean(var)) else 0.0
+    eps = float(cfg.cov_eps_base + cfg.cov_eps_scale * max(avg_var, 0.0))
+    return eps
 
 
-# -----------------------------
-# Win algorithm (offline)
-# -----------------------------
 def compute_Z_scores(
     t_s: np.ndarray,
     XY: np.ndarray,
@@ -262,42 +256,49 @@ def compute_Z_scores(
     Z = np.full_like(centers, np.nan, dtype=float)
 
     for i, tc in enumerate(centers):
-        p0, p1 = tc - w, tc
-        q0, q1 = tc, tc + w
-        r0, r1 = tc - w, tc + w
+        a = tc - w
+        b = tc + w
+        # indices for r, p, q
+        ir0 = int(np.searchsorted(t_s, a, side="left"))
+        ir1 = int(np.searchsorted(t_s, b, side="right"))
+        ip0 = ir0
+        ip1 = int(np.searchsorted(t_s, tc, side="right"))
+        iq0 = int(np.searchsorted(t_s, tc, side="left"))
+        iq1 = ir1
 
-        ip0 = int(np.searchsorted(t_s, p0, side="left"))
-        ip1 = int(np.searchsorted(t_s, p1, side="right"))
-        iq0 = int(np.searchsorted(t_s, q0, side="left"))
-        iq1 = int(np.searchsorted(t_s, q1, side="right"))
-        ir0 = int(np.searchsorted(t_s, r0, side="left"))
-        ir1 = int(np.searchsorted(t_s, r1, side="right"))
-
+        Yr = XY[ir0:ir1]
         Yp = XY[ip0:ip1]
         Yq = XY[iq0:iq1]
-        Yr = XY[ir0:ir1]
 
-        if Yp.shape[0] < 3 or Yq.shape[0] < 3 or Yr.shape[0] < 3:
-            continue
+        eps_r = compute_cov_eps(Yr, cfg)
+        eps_p = compute_cov_eps(Yp, cfg)
+        eps_q = compute_cov_eps(Yq, cfg)
 
-        eps = compute_eps_from_data(Yr, base=cfg.cov_eps_base, scale=cfg.cov_eps_scale)
+        cr = c3_cost(Yr, eps=eps_r)
+        cp = c3_cost(Yp, eps=eps_p)
+        cq = c3_cost(Yq, eps=eps_q)
 
-        cr = c3_cost(Yr, eps)
-        cp = c3_cost(Yp, eps)
-        cq = c3_cost(Yq, eps)
-
-        if not (np.isfinite(cr) and np.isfinite(cp) and np.isfinite(cq)):
-            continue
-
-        Z[i] = cr - cp - cq
+        if np.isfinite(cr) and np.isfinite(cp) and np.isfinite(cq):
+            Z[i] = float(cr - cp - cq)
 
     return centers, Z
 
 
+# -----------------------------
+# Peak selection
+# -----------------------------
+def robust_mad(x: np.ndarray) -> float:
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return 0.0
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    return float(mad * 1.4826)  # approx std
+
+
 def estimate_beta_from_Z(Z: np.ndarray) -> float:
     """
-    Adaptive beta:
-      beta = max(median(Z)+3*MAD(Z), percentile(Z, 95), 0)
+    Adaptive beta threshold. Tweak here to get more/fewer segments.
     """
     Zf = Z[np.isfinite(Z)]
     if Zf.size == 0:
@@ -314,38 +315,43 @@ def pick_peaks_greedy(
     Z: np.ndarray,
     beta: float,
     min_dist_s: float,
-    local_maxima_only: bool = True,
+    local_maxima_only: bool = True
 ) -> List[float]:
     """
-    Peak detection:
-      - candidate peaks: local maxima (optional) and Z >= beta
-      - enforce min distance by greedy selection in descending Z
+    Pick peaks where Z >= beta.
+    If local_maxima_only: restrict to local maxima.
+    Greedy selection by descending Z, enforcing min distance.
+    Returns chosen change points (seconds).
     """
     centers_s = np.asarray(centers_s, dtype=float)
     Z = np.asarray(Z, dtype=float)
-    good = np.isfinite(Z) & np.isfinite(centers_s)
-    centers_s = centers_s[good]
-    Z = Z[good]
-    if Z.size == 0:
+    if centers_s.size == 0 or Z.size == 0:
         return []
 
-    candidates: List[int] = []
-    for i in range(Z.size):
-        if Z[i] < beta:
-            continue
-        if local_maxima_only:
+    finite = np.isfinite(Z)
+    centers_s = centers_s[finite]
+    Z = Z[finite]
+    if centers_s.size == 0:
+        return []
+
+    cand = np.where(Z >= float(beta))[0]
+    if cand.size == 0:
+        return []
+
+    if local_maxima_only and cand.size > 0:
+        # keep only local maxima among candidates
+        keep = []
+        for i in cand:
             left = Z[i - 1] if i - 1 >= 0 else -np.inf
             right = Z[i + 1] if i + 1 < Z.size else -np.inf
-            if not (Z[i] > left and Z[i] >= right):
-                continue
-        candidates.append(i)
+            if Z[i] >= left and Z[i] >= right:
+                keep.append(i)
+        cand = np.array(keep, dtype=int)
+        if cand.size == 0:
+            return []
 
-    if not candidates:
-        return []
-
-    candidates = np.array(candidates, dtype=int)
-    order = candidates[np.argsort(Z[candidates])[::-1]]
-
+    # greedy by descending Z
+    order = cand[np.argsort(Z[cand])[::-1]]
     chosen: List[float] = []
     for idx in order:
         tc = float(centers_s[idx])
@@ -362,27 +368,16 @@ def build_segments_from_cps(
     min_seg_len_s: float
 ) -> List[Tuple[float, float]]:
     """
-    Turn change-points into segments [start,end], enforce min segment length.
+    Turn change-points into segments [start,end], enforce min
+    t_s is relative seconds starting at 0.
     """
+    t_s = np.asarray(t_s, dtype=float)
     if t_s.size == 0:
         return []
-    start0 = 0.0
-    endT = float(t_s[-1])
 
-    cps = [cp for cp in cps_s if (cp > start0 and cp < endT)]
-    cps.sort()
+    bounds = [0.0] + [float(c) for c in cps_s] + [float(t_s[-1])]
+    bounds = sorted(bounds)
 
-    cleaned: List[float] = []
-    prev = start0
-    for cp in cps:
-        if cp - prev >= min_seg_len_s:
-            cleaned.append(cp)
-            prev = cp
-
-    while cleaned and (endT - cleaned[-1] < min_seg_len_s):
-        cleaned.pop()
-
-    bounds = [start0] + cleaned + [endT]
     segs: List[Tuple[float, float]] = []
     for a, b in zip(bounds[:-1], bounds[1:]):
         if b - a >= min_seg_len_s:
@@ -390,48 +385,128 @@ def build_segments_from_cps(
     return segs
 
 
+def build_fixed_segments(
+    t_s: np.ndarray,
+    win_s: float,
+    stride_s: float,
+    min_seg_len_s: float,
+    drop_last: bool = False
+) -> List[Tuple[float, float]]:
+    """
+    Build fixed-length sliding window segments over the recording.
+    Segments are expressed in seconds relative to t_s[0] (same coordinate system as t_s).
+
+    - Start at 0.0s
+    - Each window is [start, start+win_s]
+    - Advance by stride_s
+    - Enforce min_seg_len_s based on actual available samples inside the window
+    - If drop_last=True, discard the last window if it would extend beyond t_s[-1]
+      Otherwise, the last window end is clipped to t_s[-1].
+
+    Returns a list of (start_s, end_s) with end_s > start_s.
+    """
+    t_s = np.asarray(t_s, dtype=float)
+    if t_s.size == 0:
+        return []
+
+    total = float(t_s[-1] - t_s[0])
+    if not np.isfinite(total) or total <= 0:
+        return []
+
+    win_s = float(win_s)
+    stride_s = float(stride_s)
+    if win_s <= 0 or stride_s <= 0:
+        return []
+
+    segs: List[Tuple[float, float]] = []
+    cur = 0.0
+
+    while cur < total - 1e-9:
+        end = cur + win_s
+        if drop_last and end > total:
+            break
+        end_clip = min(end, total)
+
+        # check actual duration in samples (avoid windows with no samples)
+        ia = int(np.searchsorted(t_s, t_s[0] + cur, side="left"))
+        ib = int(np.searchsorted(t_s, t_s[0] + end_clip, side="right"))
+        if ib <= ia:
+            cur += stride_s
+            continue
+
+        seg_len = float(t_s[ib - 1] - t_s[ia])
+        if seg_len >= float(min_seg_len_s):
+            segs.append((float(cur), float(end_clip)))
+
+        cur += stride_s
+
+    return segs
+
+
 # -----------------------------
 # PI extraction per segment
 # -----------------------------
-def extract_pi_for_segment(
-    pi_mod,
-    df_seg: pd.DataFrame,
-    fullnames: List[str],
-    screen_w: float,
-    screen_h: float,
-) -> np.ndarray:
-    """
-    Calls PI module with dfw containing ONLY ['timestamp','x','y'] and no duplicate columns.
-    """
-    if df_seg.empty:
-        return np.full((len(fullnames),), np.nan, dtype=float)
+import inspect
 
-    # df_seg coming from normalize_columns() should already have unique timestamp/x/y
-    dfw = df_seg[["timestamp", "x", "y"]].copy()
-    dfw = dfw.dropna()
+def extract_pi_for_segment(pi_mod, df_seg: pd.DataFrame, fullnames: List[str], screen_w: float, screen_h: float) -> np.ndarray:
+    """
+    Compute PI vector for one segment using the PI module WITHOUT modifying it.
+
+    Supports PI module variants:
+      - compute_window_base_vectors(dfw, w_start_ms, w_end_ms, screen_w, screen_h)
+      - build_pi_from_fullnames(base_vecs, fullnames) -> dict {fullname: value/None}
+    """
+    dfw = df_seg.copy()
+
+    # required columns
+    for col in ("x", "y", "timestamp"):
+        if col not in dfw.columns:
+            raise KeyError(f"df_seg missing required column: {col}")
+
+    # numeric + clean
+    dfw["x"] = pd.to_numeric(dfw["x"], errors="coerce")
+    dfw["y"] = pd.to_numeric(dfw["y"], errors="coerce")
+    dfw["timestamp"] = pd.to_numeric(dfw["timestamp"], errors="coerce")
+    dfw = dfw.dropna(subset=["x", "y", "timestamp"]).reset_index(drop=True)
     if dfw.empty:
-        return np.full((len(fullnames),), np.nan, dtype=float)
+        raise ValueError("Empty segment after dropping NaNs")
 
+    # segment bounds in ms (PI module expects ms)
     w_start_ms = int(dfw["timestamp"].iloc[0])
     w_end_ms = int(dfw["timestamp"].iloc[-1])
+    if w_end_ms < w_start_ms:
+        w_start_ms, w_end_ms = w_end_ms, w_start_ms
 
-    base_vecs = pi_mod.compute_window_base_vectors(
-        dfw=dfw,
-        w_start_ms=w_start_ms,
-        w_end_ms=w_end_ms,
-        screen_w=float(screen_w),
-        screen_h=float(screen_h),
-    )
-    pi_dict = pi_mod.build_pi_from_fullnames(base_vecs=base_vecs, fullnames=fullnames)
+    sw = float(screen_w)
+    sh = float(screen_h)
 
-    out = np.empty((len(fullnames),), dtype=float)
+    # --- compute base vectors ---
+    cbv = pi_mod.compute_window_base_vectors
+    sig_cbv = inspect.signature(cbv)
+    if len(sig_cbv.parameters) >= 5:
+        base_vecs = cbv(dfw, w_start_ms, w_end_ms, sw, sh)
+    else:
+        base_vecs = cbv(dfw)
+
+    # --- build PI dict ---
+    if not hasattr(pi_mod, "build_pi_from_fullnames"):
+        raise AttributeError("PI module has no build_pi_from_fullnames(). Cannot compute PI values.")
+    pi_dict = pi_mod.build_pi_from_fullnames(base_vecs, fullnames)
+
+    # --- dict -> vector aligned with fullnames ---
+    vec = np.empty((len(fullnames),), dtype=np.float32)
     for i, name in enumerate(fullnames):
         v = pi_dict.get(name, None)
-        try:
-            out[i] = float(v) if v is not None else np.nan
-        except Exception:
-            out[i] = np.nan
-    return out
+        if v is None:
+            vec[i] = np.nan
+        else:
+            try:
+                vf = float(v)
+                vec[i] = vf if np.isfinite(vf) else np.nan
+            except Exception:
+                vec[i] = np.nan
+
+    return vec
 
 
 # -----------------------------
@@ -444,6 +519,10 @@ def process_one_eyetracking_file(
     cfg: SegConfig,
     screen_w: float,
     screen_h: float,
+    segmentation: str = "dynamic",
+    fixed_win_s: float = 10.0,
+    fixed_stride_s: float = 2.0,
+    fixed_drop_last: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Returns:
@@ -459,23 +538,33 @@ def process_one_eyetracking_file(
     t_s = infer_time_unit_and_make_seconds(ts)
     XY = df[["x", "y"]].to_numpy(dtype=float)
 
-    centers_s, Z = compute_Z_scores(t_s=t_s, XY=XY, cfg=cfg)
+    if segmentation == "fixed":
+        segments = build_fixed_segments(
+            t_s=t_s,
+            win_s=float(fixed_win_s),
+            stride_s=float(fixed_stride_s),
+            min_seg_len_s=float(cfg.min_segment_len_s),
+            drop_last=bool(fixed_drop_last),
+        )
+        beta_used = float("nan")
+    else:
+        centers_s, Z = compute_Z_scores(t_s=t_s, XY=XY, cfg=cfg)
 
-    beta_used = cfg.beta if cfg.beta is not None else estimate_beta_from_Z(Z)
+        beta_used = cfg.beta if cfg.beta is not None else estimate_beta_from_Z(Z)
 
-    cps_s = pick_peaks_greedy(
-        centers_s=centers_s,
-        Z=Z,
-        beta=float(beta_used),
-        min_dist_s=float(cfg.min_cp_distance_s),
-        local_maxima_only=bool(cfg.local_maxima_only),
-    )
+        cps_s = pick_peaks_greedy(
+            centers_s=centers_s,
+            Z=Z,
+            beta=float(beta_used),
+            min_dist_s=float(cfg.min_cp_distance_s),
+            local_maxima_only=bool(cfg.local_maxima_only),
+        )
 
-    segments = build_segments_from_cps(
-        t_s=t_s,
-        cps_s=cps_s,
-        min_seg_len_s=float(cfg.min_segment_len_s),
-    )
+        segments = build_segments_from_cps(
+            t_s=t_s,
+            cps_s=cps_s,
+            min_seg_len_s=float(cfg.min_segment_len_s),
+        )
 
     feats: List[np.ndarray] = []
     seg_starts: List[float] = []
@@ -495,20 +584,124 @@ def process_one_eyetracking_file(
             screen_w=screen_w,
             screen_h=screen_h,
         )
+
         feats.append(f)
-        seg_starts.append(a)
-        seg_ends.append(b)
+        seg_starts.append(float(a))
+        seg_ends.append(float(b))
 
-    if not feats:
-        X = np.zeros((0, len(fullnames)), dtype=float)
-        seg_start_s = np.zeros((0,), dtype=float)
-        seg_end_s = np.zeros((0,), dtype=float)
+    if len(feats) == 0:
+        X = np.zeros((0, len(fullnames)), dtype=np.float32)
+        ss = np.zeros((0,), dtype=np.float32)
+        ee = np.zeros((0,), dtype=np.float32)
     else:
-        X = np.stack(feats, axis=0)
-        seg_start_s = np.asarray(seg_starts, dtype=float)
-        seg_end_s = np.asarray(seg_ends, dtype=float)
+        X = np.stack(feats, axis=0).astype(np.float32)
+        ss = np.asarray(seg_starts, dtype=np.float32)
+        ee = np.asarray(seg_ends, dtype=np.float32)
 
-    return X, seg_start_s, seg_end_s, float(beta_used)
+    return X, ss, ee, float(beta_used)
+
+
+# -----------------------------
+# PI list loading from Excel
+# -----------------------------
+def load_pi_fullnames_from_excel(excel_path: Path, sheet_name: str) -> List[str]:
+    """
+    Loads PI names (fullnames) from the given Excel sheet.
+    Expects a column that contains PI keys/names. This code tries common variants.
+    """
+    df = pd.read_excel(excel_path, sheet_name=sheet_name)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Common column candidates
+    candidates = [
+        "pi_fullname", "pi_fullnames", "fullnames", "fullname",
+        "pi_key", "pi_keys", "key", "keys",
+        "PI", "PI_key", "PI_KEY"
+    ]
+
+    col = None
+    for c in candidates:
+        if c in df.columns:
+            col = c
+            break
+
+    if col is None:
+        # fallback: use first column
+        col = df.columns[0]
+
+    fullnames = [str(v).strip() for v in df[col].dropna().tolist()]
+    # remove empties
+    fullnames = [x for x in fullnames if x != ""]
+    if len(fullnames) == 0:
+        raise RuntimeError(f"No PI names found in excel={excel_path} sheet={sheet_name} col={col}")
+    return fullnames
+
+
+# -----------------------------
+# Label mapping
+# -----------------------------
+LABEL_MAP = {
+    "non-adhd": 0,
+    "nonadhd": 0,
+    "non_adhd": 0,
+    "control": 0,
+    "inattentive": 1,
+    "combined": 2,
+    "subclinical": 3,
+}
+
+
+def normalize_group_label(s: str) -> str:
+    s = str(s).strip().lower()
+    s = s.replace(" ", "").replace("-", "").replace("_", "")
+    return s
+
+
+def load_labels(label_csv: Path) -> Dict[str, Dict]:
+    """
+    Load label CSV into dict keyed by client_id.
+    Returns mapping: client_id -> {group_label, y, ...}
+    """
+    df = pd.read_csv(label_csv)
+    df.columns = [str(c).strip() for c in df.columns]
+    if "client_id" not in df.columns or "group_label" not in df.columns:
+        raise KeyError("label_csv missing required columns: client_id, group_label")
+
+    out: Dict[str, Dict] = {}
+    for _, row in df.iterrows():
+        cid = str(row["client_id"]).strip()
+        gl = str(row["group_label"]).strip()
+        key = normalize_group_label(gl)
+        if key not in LABEL_MAP:
+            # try raw lower
+            key2 = str(gl).strip().lower()
+            y = LABEL_MAP.get(key2, None)
+        else:
+            y = LABEL_MAP[key]
+
+        if y is None:
+            # skip unknown
+            continue
+        out[cid] = {
+            "client_id": cid,
+            "group_label": gl,
+            "y": int(y),
+        }
+    return out
+
+
+# -----------------------------
+# Locate raw eye-tracking files
+# -----------------------------
+def find_eyetracking_files_for_client(root_dir: Path, client_id: str, test_type: str) -> List[Path]:
+    """
+    Search pattern:
+      {date}/{client_id}/{test_type}/eye-tracking/*/eye-tracking.csv
+    """
+    pattern = str(root_dir / "*" / client_id / test_type / "eye-tracking" / "*" / "eye-tracking.csv")
+    files = [Path(p) for p in glob.glob(pattern)]
+    files = sorted([p for p in files if p.exists()])
+    return files
 
 
 # -----------------------------
@@ -546,6 +739,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--cov_eps_base", type=float, default=1e-6)
     ap.add_argument("--cov_eps_scale", type=float, default=1e-3)
 
+    # segmentation mode
+    ap.add_argument("--segmentation", type=str, default="dynamic", choices=["dynamic", "fixed"],
+                    help="Segmentation method: dynamic (Win+C3) or fixed (sliding fixed windows)")
+    ap.add_argument("--fixed_win_s", type=float, default=10.0,
+                    help="Fixed window length in seconds (used when --segmentation fixed)")
+    ap.add_argument("--fixed_stride_s", type=float, default=2.0,
+                    help="Fixed window stride in seconds (used when --segmentation fixed)")
+    ap.add_argument("--fixed_drop_last", action="store_true",
+                    help="If set, drop the last window if it would exceed the recording end time")
+
     ap.add_argument("--max_clients", type=int, default=None,
                     help="Optional: limit number of clients processed (debug)")
     ap.add_argument("--overwrite", action="store_true",
@@ -554,63 +757,44 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main() -> None:
     args = parse_args()
 
     root_dir = Path(args.root_dir)
     label_csv = Path(args.label_csv)
     out_dir = Path(args.out_dir)
-    ensure_dir(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not root_dir.exists():
-        raise FileNotFoundError(f"root_dir not found: {root_dir}")
-    if not label_csv.exists():
-        raise FileNotFoundError(f"label_csv not found: {label_csv}")
+    # Load PI module (fixed path)
+    pi_mod = load_pi_module(str(PI_EXTRACTOR_PATH))
 
-    # CHANGE #2: PI extractor path is fixed; no CLI argument
-    pi_py_path = Path(PI_PY_FIXED)
-    if not pi_py_path.exists():
-        raise FileNotFoundError(f"PI python file not found at fixed path: {pi_py_path}")
-    pi_mod = load_pi_module(str(pi_py_path))
-
-    # Load PI fullnames from excel (defines feature order)
-    pi_excel = Path(args.pi_excel)
-    if not pi_excel.exists():
-        raise FileNotFoundError(f"pi_excel not found: {pi_excel}")
-    fullnames = pi_mod.load_pi_fullnames_from_excel(str(pi_excel), sheet_name=args.pi_sheet)
-
-    if not isinstance(fullnames, list) or len(fullnames) == 0:
-        raise RuntimeError("Failed to load PI fullnames list from excel.")
-    if len(fullnames) != 444:
-        print(f"[WARN] PI fullname count is {len(fullnames)} (expected 444). Proceeding anyway.")
+    # Load PI names from Excel
+    pi_excel_path = Path(args.pi_excel)
+    fullnames = load_pi_fullnames_from_excel(pi_excel_path, sheet_name=str(args.pi_sheet))
+    n_feat = len(fullnames)
 
     # Load labels
-    df_lab = pd.read_csv(label_csv)
-    required = {"client_id", "group_label"}
-    if not required.issubset(df_lab.columns):
-        raise ValueError(f"Label CSV must contain columns {required}, got {set(df_lab.columns)}")
+    labels = load_labels(label_csv)
 
-    df_lab["group_label_norm"] = df_lab["group_label"].astype(str).str.strip()
-    df_lab["y"] = df_lab["group_label_norm"].map(LABEL_MAP)
-    df_lab = df_lab.dropna(subset=["client_id", "y"]).copy()
-    df_lab["y"] = df_lab["y"].astype(int)
-
+    # Config
     cfg = SegConfig(
         half_window_s=float(args.half_window_s),
         step_s=float(args.step_s),
         min_cp_distance_s=float(args.min_cp_distance_s),
         min_segment_len_s=float(args.min_segment_len_s),
-        beta=float(args.beta) if args.beta is not None else None,
+        beta=args.beta if args.beta is None else float(args.beta),
         cov_eps_base=float(args.cov_eps_base),
         cov_eps_scale=float(args.cov_eps_scale),
         local_maxima_only=True,
     )
 
-    test_type = str(args.test_type)
-
-    rows = df_lab[["client_id", "group_label_norm", "y"]].drop_duplicates().to_dict("records")
+    # Process clients
+    client_ids = sorted(labels.keys())
     if args.max_clients is not None:
-        rows = rows[: int(args.max_clients)]
+        client_ids = client_ids[: int(args.max_clients)]
 
     summary = {
         "n_clients": 0,
@@ -620,23 +804,23 @@ def main() -> None:
         "avg_segments": None,
         "beta_stats": {},
     }
-    seg_counts = []
-    betas = []
 
-    import glob
+    seg_counts: List[int] = []
+    betas_used: List[float] = []
 
-    for r in tqdm(rows, desc="clients"):
-        client_id = str(r["client_id"])
-        group_label = str(r["group_label_norm"])
-        y = int(r["y"])
+    for cid in tqdm(client_ids, desc="clients"):
+        info = labels[cid]
+        y = int(info["y"])
+        group_label = str(info["group_label"])
+        test_type = str(args.test_type)
 
-        out_file = out_dir / f"{client_id}_{test_type}.npz"
-        if out_file.exists() and not args.overwrite:
+        # Output file name includes test type
+        out_path = out_dir / f"{cid}_{test_type}.npz"
+        if out_path.exists() and not args.overwrite:
             summary["n_cached"] += 1
             continue
 
-        pattern = str(root_dir / "*" / client_id / test_type / "eye-tracking" / "*" / "eye-tracking.csv")
-        files = [Path(p) for p in sorted(glob.glob(pattern))]
+        files = find_eyetracking_files_for_client(root_dir, cid, test_type=test_type)
 
         if not files:
             summary["n_skipped_no_files"] += 1
@@ -654,72 +838,95 @@ def main() -> None:
                     cfg=cfg,
                     screen_w=float(args.screen_w),
                     screen_h=float(args.screen_h),
+                    segmentation=str(args.segmentation),
+                    fixed_win_s=float(args.fixed_win_s),
+                    fixed_stride_s=float(args.fixed_stride_s),
+                    fixed_drop_last=bool(args.fixed_drop_last),
                 )
                 if X.shape[0] == 0:
                     continue
-
                 all_X.append(X)
                 all_ss.append(ss)
                 all_ee.append(ee)
-                file_meta.append({
-                    "file": str(f),
-                    "n_segments": int(X.shape[0]),
-                    "beta_used": float(beta_used),
-                })
-                betas.append(float(beta_used))
+                betas_used.append(beta_used)
+                file_meta.append(str(f))
 
-            if not all_X:
+            if len(all_X) == 0:
+                # still save empty? skip
+                summary["n_failed"] += 1
+                print(f"[ERROR] client_id={cid} failed: no usable segments")
                 continue
 
-            X_cat = np.concatenate(all_X, axis=0)
-            ss_cat = np.concatenate(all_ss, axis=0)
-            ee_cat = np.concatenate(all_ee, axis=0)
+            X_all = np.concatenate(all_X, axis=0).astype(np.float32)
+            ss_all = np.concatenate(all_ss, axis=0).astype(np.float32)
+            ee_all = np.concatenate(all_ee, axis=0).astype(np.float32)
 
+            # Basic sanity: enforce monotonic starts
+            order = np.argsort(ss_all)
+            X_all = X_all[order]
+            ss_all = ss_all[order]
+            ee_all = ee_all[order]
+
+            # Save
             np.savez_compressed(
-                out_file,
-                X=X_cat.astype(np.float32),
-                seg_start_s=ss_cat.astype(np.float32),
-                seg_end_s=ee_cat.astype(np.float32),
+                out_path,
+                X=X_all,
                 y=np.int64(y),
-                client_id=client_id,
+                seg_start_s=ss_all,
+                seg_end_s=ee_all,
+                client_id=cid,
                 group_label=group_label,
                 test_type=test_type,
-                pi_fullnames=np.array(fullnames, dtype=object),
-                files=json.dumps(file_meta, ensure_ascii=False),
-                seg_config=json.dumps(cfg.__dict__, ensure_ascii=False),
                 screen_w=float(args.screen_w),
                 screen_h=float(args.screen_h),
+                files=np.array(file_meta, dtype=object),
+                pi_fullnames=np.array(fullnames, dtype=object),
+                segmentation=str(args.segmentation),
+                fixed_win_s=float(args.fixed_win_s),
+                fixed_stride_s=float(args.fixed_stride_s),
+                half_window_s=float(cfg.half_window_s),
+                step_s=float(cfg.step_s),
+                min_cp_distance_s=float(cfg.min_cp_distance_s),
+                min_segment_len_s=float(cfg.min_segment_len_s),
             )
 
             summary["n_clients"] += 1
-            seg_counts.append(int(X_cat.shape[0]))
+            seg_counts.append(int(X_all.shape[0]))
 
         except Exception as e:
             summary["n_failed"] += 1
+            print(f"[ERROR] client_id={cid} failed: {e}")
             import traceback
-            print(f"\n[ERROR] client_id={client_id} failed: {e}", file=sys.stderr)
             traceback.print_exc()
-            continue
 
-    if seg_counts:
+    if len(seg_counts) > 0:
         summary["avg_segments"] = float(np.mean(seg_counts))
-    if betas:
-        b = np.asarray(betas, dtype=float)
-        summary["beta_stats"] = {
-            "mean": float(np.mean(b)),
-            "median": float(np.median(b)),
-            "p90": float(np.percentile(b, 90)),
-            "p95": float(np.percentile(b, 95)),
-        }
+    else:
+        summary["avg_segments"] = None
 
+    # beta stats (only meaningful for dynamic; fixed will be NaN)
+    bu = np.array(betas_used, dtype=float)
+    bu = bu[np.isfinite(bu)]
+    if bu.size > 0:
+        summary["beta_stats"] = {
+            "count": int(bu.size),
+            "mean": float(np.mean(bu)),
+            "std": float(np.std(bu)),
+            "min": float(np.min(bu)),
+            "max": float(np.max(bu)),
+        }
+    else:
+        summary["beta_stats"] = {}
+
+    # Save summary
     summary_path = out_dir / "preprocess_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     print("\nDone.")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"Cache dir: {out_dir}")
-    print(f"Summary:  {summary_path}")
+    print("Cache dir:", str(out_dir))
+    print("Summary: ", str(summary_path))
 
 
 if __name__ == "__main__":
