@@ -32,7 +32,7 @@ Usage example:
   python preprocess.py \
     --root_dir /data_248/pdss/hospital_data_real \
     --label_csv /data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv \
-    --test_type gng \
+    --test_type dnb \
     --out_dir /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output \
     --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/Primitive Indicator Lists.xlsx" \
     --pi_sheet eye-tracking
@@ -85,7 +85,7 @@ TEST_TYPE_DEFAULT = "vst"
 # -----------------------------
 @dataclass
 class SegConfig:
-    half_window_s: float = 10.0          # w
+    half_window_s: float = 2.5          # w
     step_s: float = 2.0                  # sliding step between centers
     min_cp_distance_s: float = 1.0       # min distance between change points
     min_segment_len_s: float = 1.0       # min segment length
@@ -304,8 +304,8 @@ def estimate_beta_from_Z(Z: np.ndarray) -> float:
         return 0.0
     med = float(np.median(Zf))
     mad = robust_mad(Zf)
-    beta1 = med + 3.0 * mad
-    beta2 = float(np.percentile(Zf, 95))
+    beta1 = med + 1.5 * mad
+    beta2 = float(np.percentile(Zf, 85))
     return float(max(beta1, beta2, 0.0))
 
 
@@ -537,8 +537,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--screen_h", type=float, default=1080.0)
 
     # segmentation config
-    ap.add_argument("--half_window_s", type=float, default=10.0)
-    ap.add_argument("--step_s", type=float, default=2.0)
+    ap.add_argument("--half_window_s", type=float, default=2.5)
+    ap.add_argument("--step_s", type=float, default=1.0)
     ap.add_argument("--min_cp_distance_s", type=float, default=1.0)
     ap.add_argument("--min_segment_len_s", type=float, default=1.0)
     ap.add_argument("--beta", type=float, default=None,
