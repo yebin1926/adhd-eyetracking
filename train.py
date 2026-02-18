@@ -34,6 +34,19 @@ Outputs:
 Notes:
 - This script trains 5 separate fold models. Each fold saves its own best .pt checkpoint.
 - The "best_checkpoint.txt" records the overall best fold+epoch and path.
+
+Running Example:
+python train.py \
+  --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/dnb_57" \
+  --test_type dnb \
+  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results" \
+  --batch_size 16 \
+  --epochs 100 \
+  --patience 15 \
+  --lr 3e-4 \
+  --weight_decay 1e-2 \
+  --num_workers 4 \
+  --device cpu
 """
 
 import argparse

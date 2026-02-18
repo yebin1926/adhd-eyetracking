@@ -1,7 +1,7 @@
 from pathlib import Path
 import numpy as np
 
-cache_dir = Path("/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/dnb_57")
+cache_dir = Path("/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/ast_42")
 
 files = sorted(cache_dir.glob("*.npz"))
 print("num npz:", len(files))
