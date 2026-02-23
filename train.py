@@ -37,9 +37,9 @@ Notes:
 
 Running Example:
 python train.py \
-  --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/ast_42" \
+  --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/ast_nan_71" \
   --test_type ast \
-  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial5_ast" \
+  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial10_ast_nan" \
   --batch_size 16 \
   --epochs 100 \
   --patience 15 \
