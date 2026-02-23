@@ -2,28 +2,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-""" 
-Details:
-	•	Student-level split (GroupKFold or fixed list)
-	•	Train loop, val loop
-	•	Macro F1, balanced acc, confusion matrix
-	•	Save best model
-
-"""
-
 """
 train.py
 
-Student-level 4-class classification using:
+Student-level 2-class classification using:
 - BiGRU + additive attention pooling (model.py)
 - Per-student cached sequences from preprocess.py (.npz files)
 - GroupKFold (5-fold) split by student (client_id) to avoid leakage
 - Early stopping on validation macro F1
-
-Metrics each epoch (val):
-- macro F1
-- balanced accuracy
-- confusion matrix
 
 Outputs:
 - Best checkpoint info written to:
@@ -36,38 +22,41 @@ Notes:
 - The "best_checkpoint.txt" records the overall best fold+epoch and path.
 
 Running Example:
-python train.py \
-  --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/ast_nan_71" \
-  --test_type ast \
-  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial10_ast_nan" \
-  --batch_size 16 \
-  --epochs 100 \
-  --patience 15 \
-  --lr 3e-4 \
-  --weight_decay 1e-2 \
-  --num_workers 4 \
-  --device cpu
+    python train.py \
+    --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/vst_nan_82" \
+    --test_type vst \
+    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial15_vst_metric" \
+    --batch_size 16 \
+    --epochs 100 \
+    --patience 15 \
+    --lr 3e-4 \
+    --weight_decay 1e-2 \
+    --num_workers 4 \
+    --device cpu
+
+CHANGED (minimal):
+- Add 80/20 hold-out TEST split by student (GroupShuffleSplit on client_id)
+- Run GroupKFold (5-fold) only on the 80% train+val set
+- After CV, evaluate best checkpoint on the held-out test set
+- Test metrics: micro F1, balanced accuracy, per-class recall, confusion matrix
 """
 
 import argparse
 import csv
 import json
-import os
 import random
-import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score
-from sklearn.model_selection import GroupKFold
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix, f1_score, recall_score
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 
 from dataset import DatasetOptions, StudentSequenceDataset, collate_student_batch, get_groups_and_labels
 from model import ModelConfig, StudentBiGRUAttnClassifier
@@ -81,7 +70,6 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # deterministic can reduce speed; keep it safe but not overly strict
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
@@ -98,16 +86,15 @@ def to_device(batch: Dict, device: torch.device) -> Dict:
     batch["y"] = batch["y"].to(device, non_blocking=True)
     batch["mask"] = batch["mask"].to(device, non_blocking=True)
     batch["lengths"] = batch["lengths"].to(device, non_blocking=True)
-    # seg_start_s / seg_end_s are not used in the model; keep on CPU
     return batch
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-) -> Dict:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict:
+    """
+    Used for validation during CV.
+    Returns macro F1, balanced acc, confusion matrix, plus raw arrays.
+    """
     model.eval()
     all_y: List[int] = []
     all_pred: List[int] = []
@@ -134,16 +121,16 @@ def evaluate(
         return {
             "macro_f1": 0.0,
             "balanced_acc": 0.0,
-            "confusion": np.zeros((4, 4), dtype=int),
+            "confusion": np.zeros((2, 2), dtype=int),
             "y_true": y_true,
             "y_pred": y_pred,
-            "probs": np.array(all_probs) if len(all_probs) else np.zeros((0, 4), dtype=float),
+            "probs": np.array(all_probs) if len(all_probs) else np.zeros((0, 2), dtype=float),
             "client_ids": all_client_ids,
         }
 
     macro_f1 = float(f1_score(y_true, y_pred, average="macro"))
     bal_acc = float(balanced_accuracy_score(y_true, y_pred))
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3]).astype(int)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1]).astype(int)
 
     return {
         "macro_f1": macro_f1,
@@ -157,21 +144,13 @@ def evaluate(
 
 
 def format_confusion(cm: np.ndarray) -> str:
-    # simple pretty string
     lines = []
     for row in cm.tolist():
         lines.append("  " + " ".join(f"{v:4d}" for v in row))
     return "\n".join(lines)
 
 
-def save_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
-    best_metric: float,
-    extra: Dict,
-) -> None:
+def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, best_metric: float, extra: Dict) -> None:
     ckpt = {
         "epoch": int(epoch),
         "best_metric": float(best_metric),
@@ -183,7 +162,7 @@ def save_checkpoint(
 
 
 # -----------------------------
-# Training
+# Training (one CV fold)
 # -----------------------------
 def train_one_fold(
     fold: int,
@@ -194,7 +173,6 @@ def train_one_fold(
     args: argparse.Namespace,
     out_dir: Path,
 ) -> Tuple[Dict, Dict]:
-    # Dataloaders
     train_loader = DataLoader(
         Subset(dataset, train_idx.tolist()),
         batch_size=args.batch_size,
@@ -214,34 +192,27 @@ def train_one_fold(
         collate_fn=collate_student_batch,
     )
 
-    # Model
     mcfg = ModelConfig(
-        in_dim=444,
+        in_dim=258,
         proj_hidden=128,
         proj_out=64,
         dropout=args.dropout,
         gru_hidden=64,
         attn_hidden=64,
-        num_classes=4,
+        num_classes=2,
         layer_norm=True,
     )
     model = StudentBiGRUAttnClassifier(mcfg).to(device)
 
-    # Loss / Optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # Tracking
     best_f1 = -1.0
     best_epoch = -1
     best_ckpt_path = out_dir / f"fold{fold}_best.pt"
     patience_counter = 0
 
-    history = {
-        "fold": fold,
-        "epochs": [],
-        "best": {},
-    }
+    history = {"fold": fold, "epochs": [], "best": {}}
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -267,23 +238,19 @@ def train_one_fold(
 
         train_loss = epoch_loss / max(n_batches, 1)
 
-        # Validate
         val_res = evaluate(model, val_loader, device)
         val_f1 = val_res["macro_f1"]
         val_bal = val_res["balanced_acc"]
         cm = val_res["confusion"]
-
         elapsed = time.time() - t0
 
-        # Log
-        ep_log = {
+        history["epochs"].append({
             "epoch": epoch,
             "train_loss": float(train_loss),
             "val_macro_f1": float(val_f1),
             "val_balanced_acc": float(val_bal),
             "time_sec": float(elapsed),
-        }
-        history["epochs"].append(ep_log)
+        })
 
         print(
             f"[Fold {fold}] Epoch {epoch:03d} | "
@@ -291,7 +258,6 @@ def train_one_fold(
         )
         print(f"[Fold {fold}] Confusion matrix (rows=true, cols=pred):\n{format_confusion(cm)}")
 
-        # Early stopping / checkpointing on macro F1
         improved = val_f1 > best_f1 + 1e-6
         if improved:
             best_f1 = val_f1
@@ -307,7 +273,6 @@ def train_one_fold(
                 "confusion": cm.tolist(),
             }
             save_checkpoint(best_ckpt_path, model, optimizer, epoch, best_f1, extra)
-
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -320,12 +285,9 @@ def train_one_fold(
         "best_ckpt_path": str(best_ckpt_path),
     }
 
-    # Load best for final fold validation predictions
     ckpt = torch.load(best_ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     fold_val_res = evaluate(model, val_loader, device)
-
-    # Add fold meta
     fold_val_res["fold"] = fold
     fold_val_res["best_epoch"] = best_epoch
     fold_val_res["best_ckpt_path"] = str(best_ckpt_path)
@@ -339,14 +301,11 @@ def train_one_fold(
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--cache_dir", type=str, required=True,
-                    help="Directory containing cached .npz files from preprocess.py")
-    ap.add_argument("--test_type", type=str, default=None,
-                    help="Optional: filter cache files by suffix _{test_type}.npz (e.g., dnb, vst, ast, flanker, gng)")
+    ap.add_argument("--cache_dir", type=str, required=True)
+    ap.add_argument("--test_type", type=str, default=None)
 
     ap.add_argument("--out_dir", type=str,
-                    default="/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results",
-                    help="Directory to save checkpoints and outputs")
+                    default="/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results")
 
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--epochs", type=int, default=100)
@@ -357,19 +316,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--weight_decay", type=float, default=1e-2)
     ap.add_argument("--dropout", type=float, default=0.3)
 
-    ap.add_argument("--patience", type=int, default=15,
-                    help="Early stop patience (epochs without val macro F1 improvement)")
+    ap.add_argument("--patience", type=int, default=15)
     ap.add_argument("--grad_clip", type=float, default=1.0)
 
-    # Dataset cleaning options
-    ap.add_argument("--drop_if_low_finite_ratio", type=float, default=None,
-                    help="If set (e.g., 0.5), drop students whose X finite ratio is below threshold.")
-    ap.add_argument("--max_segments", type=int, default=None,
-                    help="Optionally truncate sequences to at most this many segments.")
+    ap.add_argument("--drop_if_low_finite_ratio", type=float, default=None)
+    ap.add_argument("--max_segments", type=int, default=None)
 
-    # Device
-    ap.add_argument("--device", type=str, default="cuda",
-                    help="cuda or cpu")
+    ap.add_argument("--device", type=str, default="cuda")
+
+    # NEW (minimal): hold-out test split fraction
+    ap.add_argument("--test_size", type=float, default=0.2,
+                    help="Fraction of students to hold out as test set (default: 0.2)")
 
     return ap.parse_args()
 
@@ -387,9 +344,8 @@ def main() -> None:
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
     print(f"Using device: {device}")
 
-    # Dataset
     ds_opts = DatasetOptions(
-        feature_dim=444,
+        feature_dim=258,
         min_segments=1,
         max_segments=args.max_segments,
         nan_to_num=True,
@@ -406,9 +362,23 @@ def main() -> None:
     )
 
     idx, y, groups = get_groups_and_labels(dataset)
+
+    # -----------------------------
+    # NEW: 80/20 hold-out test split by student (group)
+    # -----------------------------
+    gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.seed)
+    trainval_pos, test_pos = next(gss.split(idx, y, groups))
+    trainval_idx = idx[trainval_pos]
+    test_idx = idx[test_pos]
+
+    print(f"[Split] total={len(idx)} | train+val={len(trainval_idx)} | test={len(test_idx)}")
+
+    # CV only on trainval set
+    y_trainval = y[trainval_pos]
+    groups_trainval = groups[trainval_pos]
+
     gkf = GroupKFold(n_splits=5)
 
-    # Storage
     fold_histories: List[Dict] = []
     all_fold_preds_rows: List[Dict] = []
 
@@ -419,8 +389,14 @@ def main() -> None:
         "ckpt_path": None,
     }
 
-    for fold, (tr_idx, va_idx) in enumerate(gkf.split(idx, y, groups), start=1):
-        print(f"\n========== Fold {fold}/5 ==========")
+    # -----------------------------
+    # GroupKFold on the 80% (train+val)
+    # -----------------------------
+    for fold, (tr_local, va_local) in enumerate(gkf.split(trainval_idx, y_trainval, groups_trainval), start=1):
+        tr_idx = trainval_idx[tr_local]
+        va_idx = trainval_idx[va_local]
+
+        print(f"\n========== Fold {fold}/5 (on train+val 80%) ==========")
         history, fold_val = train_one_fold(
             fold=fold,
             train_idx=tr_idx,
@@ -432,49 +408,44 @@ def main() -> None:
         )
         fold_histories.append(history)
 
-        # Record fold best to overall best
         if fold_val["macro_f1"] > overall_best["macro_f1"]:
             overall_best["macro_f1"] = float(fold_val["macro_f1"])
             overall_best["fold"] = int(fold_val["fold"])
             overall_best["epoch"] = int(fold_val["best_epoch"])
             overall_best["ckpt_path"] = str(fold_val["best_ckpt_path"])
 
-        # Build per-student prediction rows (val set for this fold)
-        probs = fold_val["probs"]  # (N,4)
+        probs = fold_val["probs"]
         y_true = fold_val["y_true"]
         y_pred = fold_val["y_pred"]
         cids = fold_val["client_ids"]
 
         for i in range(len(cids)):
-            row = {
+            all_fold_preds_rows.append({
                 "client_id": cids[i],
                 "fold": fold,
+                "split": "val",
                 "y_true": int(y_true[i]),
                 "y_pred": int(y_pred[i]),
                 "p0": float(probs[i, 0]) if probs.shape[0] else 0.0,
                 "p1": float(probs[i, 1]) if probs.shape[0] else 0.0,
-                "p2": float(probs[i, 2]) if probs.shape[0] else 0.0,
-                "p3": float(probs[i, 3]) if probs.shape[0] else 0.0,
-            }
-            all_fold_preds_rows.append(row)
+            })
 
-    # Save histories
+    # Save CV history and val predictions
     hist_path = out_dir / "training_history.json"
     with open(hist_path, "w", encoding="utf-8") as f:
         json.dump(fold_histories, f, indent=2, ensure_ascii=False)
 
-    # Save predictions CSV (all folds combined; each student appears once as val)
     pred_csv_path = out_dir / "per_student_predictions.csv"
     with open(pred_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["client_id", "fold", "y_true", "y_pred", "p0", "p1", "p2", "p3"],
+            fieldnames=["client_id", "fold", "split", "y_true", "y_pred", "p0", "p1"],
         )
         writer.writeheader()
         for row in all_fold_preds_rows:
             writer.writerow(row)
 
-    # Save best checkpoint info to required text path
+    # Save best checkpoint info
     best_txt_path = out_dir / "best_checkpoint.txt"
     with open(best_txt_path, "w", encoding="utf-8") as f:
         f.write(f"overall_best_macro_f1: {overall_best['macro_f1']:.6f}\n")
@@ -482,12 +453,92 @@ def main() -> None:
         f.write(f"overall_best_epoch: {overall_best['epoch']}\n")
         f.write(f"overall_best_ckpt_path: {overall_best['ckpt_path']}\n")
         f.write(f"history_json: {str(hist_path)}\n")
-        f.write(f"predictions_csv: {str(pred_csv_path)}\n")
+        f.write(f"val_predictions_csv: {str(pred_csv_path)}\n")
+
+    # -----------------------------
+    # NEW: TEST evaluation on held-out 20%
+    # -----------------------------
+    print("\n========== Testing on held-out 20% ==========")
+    if overall_best["ckpt_path"] is None:
+        raise RuntimeError("No best checkpoint found; cannot run test evaluation.")
+
+    # Build model and load checkpoint
+    mcfg = ModelConfig(
+        in_dim=258,
+        proj_hidden=128,
+        proj_out=64,
+        dropout=args.dropout,
+        gru_hidden=64,
+        attn_hidden=64,
+        num_classes=2,
+        layer_norm=True,
+    )
+    model = StudentBiGRUAttnClassifier(mcfg).to(device)
+    ckpt = torch.load(overall_best["ckpt_path"], map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+
+    test_loader = DataLoader(
+        Subset(dataset, test_idx.tolist()),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=collate_student_batch,
+    )
+
+    test_res = evaluate(model, test_loader, device)
+    y_true = test_res["y_true"]
+    y_pred = test_res["y_pred"]
+    cm = test_res["confusion"]
+    bal_acc = float(test_res["balanced_acc"])
+
+    micro_f1 = float(f1_score(y_true, y_pred, average="micro")) if y_true.size else 0.0
+    per_class_recall = recall_score(y_true, y_pred, labels=[0, 1], average=None, zero_division=0).astype(float).tolist()
+
+    print(f"[TEST] micro_f1={micro_f1:.4f} | balanced_acc={bal_acc:.4f}")
+    print(f"[TEST] per_class_recall (0..1)={per_class_recall}")
+    print(f"[TEST] Confusion matrix (rows=true, cols=pred):\n{format_confusion(cm)}")
+
+    test_metrics = {
+        "micro_f1": micro_f1,
+        "balanced_accuracy": bal_acc,
+        "per_class_recall": per_class_recall,
+        "confusion_matrix": cm.tolist(),
+        "n_test_students": int(len(test_idx)),
+        "best_ckpt_used": str(overall_best["ckpt_path"]),
+    }
+
+    test_metrics_path = out_dir / "test_metrics.json"
+    with open(test_metrics_path, "w", encoding="utf-8") as f:
+        json.dump(test_metrics, f, indent=2, ensure_ascii=False)
+
+    # Save test predictions
+    test_pred_path = out_dir / "test_predictions.csv"
+    with open(test_pred_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["client_id", "split", "y_true", "y_pred", "p0", "p1"],
+        )
+        writer.writeheader()
+        probs = test_res["probs"]
+        cids = test_res["client_ids"]
+        for i in range(len(cids)):
+            writer.writerow({
+                "client_id": cids[i],
+                "split": "test",
+                "y_true": int(y_true[i]),
+                "y_pred": int(y_pred[i]),
+                "p0": float(probs[i, 0]) if probs.shape[0] else 0.0,
+                "p1": float(probs[i, 1]) if probs.shape[0] else 0.0,
+            })
 
     print("\n========== Done ==========")
     print(f"History saved to: {hist_path}")
-    print(f"Predictions saved to: {pred_csv_path}")
+    print(f"Val predictions saved to: {pred_csv_path}")
     print(f"Best checkpoint info saved to: {best_txt_path}")
+    print(f"Test metrics saved to: {test_metrics_path}")
+    print(f"Test predictions saved to: {test_pred_path}")
     print(json.dumps(overall_best, indent=2, ensure_ascii=False))
 
 

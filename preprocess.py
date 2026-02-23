@@ -8,7 +8,7 @@ Details:
 	•	Sliding window scores (Win) using C3 cost
 	•	Peak picking + min distance + min segment length
 	•	Segment the series
-	•	Compute PI vector (444) per segment
+	•	Compute PI vector (258)) per segment
 	•	Save cached file per student
 
 """
@@ -16,7 +16,7 @@ Details:
 preprocess.py
 - Load raw eye-tracking CSVs
 - Dynamic segmentation using Win + C3 cost
-- Extract PI features per segment (target: 444 features/segment)
+- Extract PI features per segment (target: 258 features/segment)
 - Save cached per-student arrays to .npz
 
 Expected directory structure (root_dir):
@@ -28,14 +28,6 @@ Labels CSV (example):
 PI extractor is fixed at:
   /data_248/pdss/primitive_indicator_scripts/scripts/intern/extract_eye_tracking_pi_window.py
 
-Usage example:
-  python preprocess.py \
-    --root_dir /data_248/pdss/hospital_data_real \
-    --label_csv /data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv \
-    --test_type ast \
-    --out_dir /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output \
-    --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/Primitive Indicator Lists.xlsx" \
-    --pi_sheet eye-tracking
 """
 """
 
@@ -51,9 +43,9 @@ Usage example:
     python preprocess.py \
   --root_dir "/data_248/pdss/hospital_data_real" \
   --label_csv "/data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv" \
-  --test_type vst \
-  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/vst_nan" \
-  --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/Primitive Indicator Lists.xlsx" \
+  --test_type dnb \
+  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/dnb_filtered" \
+  --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/Primitive Indicator Lists_filtered.xlsx" \
   --pi_sheet "eye-tracking" \
   --half_window_s 2.5 \
   --step_s 1.0 \
@@ -84,20 +76,17 @@ PI_PY_FIXED = "/data_248/pdss/primitive_indicator_scripts/scripts/intern/extract
 # Label mapping
 # -----------------------------
 LABEL_MAP = {
-    "Non-ADHD": 0,
-    "NonADHD": 0,
+    "Non-ADHD": 0, #no adhd
     "Non_adhd": 0,
     "Non-adhd": 0,
     "non-adhd": 0,
-    "nonadhd": 0,
     "Non_ADHD": 0,
-    "Inattentive": 1,
+    "Inattentive": 1, #adhd
     "inattentive": 1,
-    "Combined": 2,
-    "combined": 2,
-    "CB": 2,
-    "Subclinical": 3,
-    "subclinical": 3,
+    "Combined": 1,
+    "combined": 1, #
+    "Subclinical": 1,
+    "subclinical": 1,
 }
 
 TEST_TYPE_DEFAULT = "vst"
@@ -644,8 +633,8 @@ def main() -> None:
 
     if not isinstance(fullnames, list) or len(fullnames) == 0:
         raise RuntimeError("Failed to load PI fullnames list from excel.")
-    if len(fullnames) != 444:
-        print(f"[WARN] PI fullname count is {len(fullnames)} (expected 444). Proceeding anyway.")
+    if len(fullnames) != 258:
+        print(f"[WARN] PI fullname count is {len(fullnames)} (expected 258). Proceeding anyway.")
 
     # Load labels
     df_lab = pd.read_csv(label_csv)

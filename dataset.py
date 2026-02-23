@@ -19,8 +19,8 @@ dataset.py
 - Collate function pads variable-length segment sequences and creates masks
 
 Expected .npz keys (from preprocess.py):
-  - X: float32 array, shape (T, F) where F=444
-  - y: int64 scalar (0..3)
+  - X: float32 array, shape (T, F) where F=258
+  - y: int64 scalar (0..1)
   - seg_start_s: float array, shape (T,)
   - seg_end_s: float array, shape (T,)
   - client_id: str
@@ -99,7 +99,7 @@ def _finite_ratio(x: np.ndarray) -> float:
 # -----------------------------
 @dataclass
 class DatasetOptions:
-    feature_dim: int = 444
+    feature_dim: int = 258
     min_segments: int = 1
     max_segments: Optional[int] = None  # truncate from the front (or back) if needed
     nan_to_num: bool = True

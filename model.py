@@ -6,7 +6,7 @@ from __future__ import annotations
 
 """ 
 Details:
-	•	Projection MLP (444→128→64)
+	•	Projection MLP (258→128→64)
 	•	BiGRU
 	•	Additive attention pooling (with mask)
 	•	Classifier head (→4 logits)
@@ -19,13 +19,13 @@ model.py
 BiGRU + Additive Attention Pooling for student-level classification.
 
 Architecture (per your spec):
-- Segment projection MLP: 444 -> 128 -> 64, dropout=0.3
+- Segment projection MLP: 258 -> 128 -> 64, dropout=0.3
 - BiGRU hidden size: 64 (bidirectional => output dim 128)
 - Additive attention size: 64
 - Classifier head: 128 -> 64 -> 4
 
 Input:
-- x: FloatTensor (B, T, 444) padded
+- x: FloatTensor (B, T, 258) padded
 - mask: BoolTensor (B, T) where True indicates valid time steps
 
 Output:
@@ -68,13 +68,13 @@ def masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> t
 # -----------------------------
 @dataclass
 class ModelConfig:
-    in_dim: int = 444
+    in_dim: int = 258
     proj_hidden: int = 128
     proj_out: int = 64
     dropout: float = 0.3
     gru_hidden: int = 64
     attn_hidden: int = 64
-    num_classes: int = 4
+    num_classes: int = 2
     layer_norm: bool = True
 
 
@@ -117,7 +117,7 @@ class StudentBiGRUAttnClassifier(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Segment projection MLP: 444 -> 128 -> 64
+        # Segment projection MLP: 258 -> 128 -> 64
         layers = [
             nn.Linear(cfg.in_dim, cfg.proj_hidden),
             nn.ReLU(),
@@ -172,7 +172,7 @@ class StudentBiGRUAttnClassifier(nn.Module):
         return_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        x:    (B, T, 444) padded
+        x:    (B, T, 258) padded
         mask: (B, T) bool, True = valid
 
         returns:
