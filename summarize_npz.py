@@ -3,7 +3,7 @@ import argparse
 import numpy as np
 """
 Example Usage:
-python summarize_npz.py --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/dnb_nan_92" --print_per_student
+python summarize_npz.py --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/dnb_filtered" --print_per_student
 
 """
 

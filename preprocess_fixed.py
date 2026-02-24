@@ -7,7 +7,7 @@ Details:
 	•	Load raw gaze per student
 	•	FIXED segmentation (window/stride in seconds)
 	•	Segment the series
-	•	Compute PI vector (444) per segment
+	•	Compute PI vector (258) per segment
 	•	Save cached file per student
 
 Minimal changes from the current (dynamic Win+C3) preprocess.py:
@@ -20,9 +20,9 @@ Usage Example:
     python preprocess_fixed.py \
   --root_dir "/data_248/pdss/hospital_data_real" \
   --label_csv "/data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv" \
-  --test_type vst \
-  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/vst_w6_s2" \
-  --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/Primitive Indicator Lists.xlsx" \
+  --test_type ast \
+  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_fixed/ast_w6_s2" \
+  --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/Primitive Indicator Lists_filtered.xlsx" \
   --pi_sheet "eye-tracking"
 
   (Optional)
@@ -59,10 +59,10 @@ LABEL_MAP = {
     "Non_ADHD": 0,
     "Inattentive": 1,
     "inattentive": 1,
-    "Combined": 2,
-    "combined": 2,
-    "Subclinical": 3,
-    "subclinical": 3,
+    "Combined": 1,
+    "combined": 1,
+    "Subclinical": 0,
+    "subclinical": 0,
 }
 
 TEST_TYPE_DEFAULT = "dnb"
@@ -453,7 +453,7 @@ def process_one_eyetracking_file(
     t_s = infer_time_unit_and_make_seconds(ts)
     XY = df[["x", "y"]].to_numpy(dtype=float)  # kept (unused) for minimal change
 
-        # FIXED segmentation on cleaned data
+    # FIXED segmentation on cleaned data
     segments = build_fixed_segments(
         t_s=t_s,
         win_s=float(cfg.fixed_win_s),
@@ -575,8 +575,8 @@ def main() -> None:
 
     if not isinstance(fullnames, list) or len(fullnames) == 0:
         raise RuntimeError("Failed to load PI fullnames list from excel.")
-    if len(fullnames) != 444:
-        print(f"[WARN] PI fullname count is {len(fullnames)} (expected 444). Proceeding anyway.")
+    if len(fullnames) != 258:
+        print(f"[WARN] PI fullname count is {len(fullnames)} (expected 258). Proceeding anyway.")
 
     # Load labels
     df_lab = pd.read_csv(label_csv)

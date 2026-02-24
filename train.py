@@ -23,9 +23,9 @@ Notes:
 
 Running Example:
     python train.py \
-    --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/vst_filtered" \
-    --test_type vst \
-    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial20_vst_filtered" \
+    --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/ast_filtered" \
+    --test_type ast \
+    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial25_ast_bal" \
     --batch_size 16 \
     --epochs 100 \
     --patience 15 \
@@ -39,6 +39,20 @@ CHANGED (minimal):
 - Run GroupKFold (5-fold) only on the 80% train+val set
 - After CV, evaluate best checkpoint on the held-out test set
 - Test metrics: micro F1, balanced accuracy, per-class recall, confusion matrix
+
+Class balancing (NEW):
+- Weighted loss (class-weighted CrossEntropy)
+- Weights are computed from the TRAIN split only (per fold), NOT from val/test
+
+Outputs:
+- Best checkpoint info written to:
+  /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/best_checkpoint.txt
+- Per-student predictions (validation across folds) written to:
+  /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/per_student_predictions.csv
+- Held-out test metrics written to:
+  test_metrics.json
+- Held-out test predictions written to:
+  test_predictions.csv
 """
 
 import argparse
@@ -92,8 +106,8 @@ def to_device(batch: Dict, device: torch.device) -> Dict:
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict:
     """
-    Used for validation during CV.
-    Returns macro F1, balanced acc, confusion matrix, plus raw arrays.
+    Used for validation during CV and for test evaluation.
+    Returns macro F1 (for early stop), balanced acc, confusion matrix, plus raw arrays.
     """
     model.eval()
     all_y: List[int] = []
@@ -204,7 +218,17 @@ def train_one_fold(
     )
     model = StudentBiGRUAttnClassifier(mcfg).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    # --- class balancing: weighted loss computed from TRAIN split only ---
+    y_train = np.asarray([dataset.labels[i] for i in train_idx.tolist()], dtype=int)
+    c0 = int(np.sum(y_train == 0))
+    c1 = int(np.sum(y_train == 1))
+    total = max(c0 + c1, 1)
+    # inverse-frequency weights: total / (num_classes * count)
+    w0 = total / (2.0 * max(c0, 1))
+    w1 = total / (2.0 * max(c1, 1))
+    class_weights = torch.tensor([w0, w1], dtype=torch.float32, device=device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_f1 = -1.0
@@ -254,7 +278,7 @@ def train_one_fold(
 
         print(
             f"[Fold {fold}] Epoch {epoch:03d} | "
-            f"loss={train_loss:.4f} | valF1={val_f1:.4f} | valBalAcc={val_bal:.4f} | {elapsed:.1f}s"
+            f"loss={train_loss:.4f} | valMacroF1={val_f1:.4f} | valBalAcc={val_bal:.4f} | {elapsed:.1f}s"
         )
         print(f"[Fold {fold}] Confusion matrix (rows=true, cols=pred):\n{format_confusion(cm)}")
 
@@ -271,12 +295,14 @@ def train_one_fold(
                 "val_macro_f1": float(val_f1),
                 "val_balanced_acc": float(val_bal),
                 "confusion": cm.tolist(),
+                "class_weights": [float(w0), float(w1)],
+                "train_counts": {"c0": c0, "c1": c1},
             }
             save_checkpoint(best_ckpt_path, model, optimizer, epoch, best_f1, extra)
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
-                print(f"[Fold {fold}] Early stopping at epoch {epoch} (best epoch {best_epoch}, bestF1={best_f1:.4f})")
+                print(f"[Fold {fold}] Early stopping at epoch {epoch} (best epoch {best_epoch}, bestMacroF1={best_f1:.4f})")
                 break
 
     history["best"] = {
@@ -324,7 +350,6 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--device", type=str, default="cuda")
 
-    # NEW (minimal): hold-out test split fraction
     ap.add_argument("--test_size", type=float, default=0.2,
                     help="Fraction of students to hold out as test set (default: 0.2)")
 
@@ -363,9 +388,7 @@ def main() -> None:
 
     idx, y, groups = get_groups_and_labels(dataset)
 
-    # -----------------------------
-    # NEW: 80/20 hold-out test split by student (group)
-    # -----------------------------
+    # 80/20 hold-out test split by student (group)
     gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.seed)
     trainval_pos, test_pos = next(gss.split(idx, y, groups))
     trainval_idx = idx[trainval_pos]
@@ -376,7 +399,6 @@ def main() -> None:
     # CV only on trainval set
     y_trainval = y[trainval_pos]
     groups_trainval = groups[trainval_pos]
-
     gkf = GroupKFold(n_splits=5)
 
     fold_histories: List[Dict] = []
@@ -389,9 +411,7 @@ def main() -> None:
         "ckpt_path": None,
     }
 
-    # -----------------------------
     # GroupKFold on the 80% (train+val)
-    # -----------------------------
     for fold, (tr_local, va_local) in enumerate(gkf.split(trainval_idx, y_trainval, groups_trainval), start=1):
         tr_idx = trainval_idx[tr_local]
         va_idx = trainval_idx[va_local]
@@ -455,9 +475,7 @@ def main() -> None:
         f.write(f"history_json: {str(hist_path)}\n")
         f.write(f"val_predictions_csv: {str(pred_csv_path)}\n")
 
-    # -----------------------------
-    # NEW: TEST evaluation on held-out 20%
-    # -----------------------------
+    # TEST evaluation on held-out 20%
     print("\n========== Testing on held-out 20% ==========")
     if overall_best["ckpt_path"] is None:
         raise RuntimeError("No best checkpoint found; cannot run test evaluation.")
