@@ -85,8 +85,8 @@ LABEL_MAP = {
     "inattentive": 1,
     "Combined": 1,
     "combined": 1, #
-    "Subclinical": 1,
-    "subclinical": 1,
+    "Subclinical": 0,
+    "subclinical": 0,
 }
 
 TEST_TYPE_DEFAULT = "vst"

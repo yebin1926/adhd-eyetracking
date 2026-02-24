@@ -1,6 +1,0 @@
-overall_best_macro_f1: 0.476190
-overall_best_fold: 4
-overall_best_epoch: 2
-overall_best_ckpt_path: /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/fold4_best.pt
-history_json: /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/training_history.json
-predictions_csv: /data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/per_student_predictions.csv
