@@ -6,42 +6,37 @@ preprocess.py
 - Load raw eye-tracking CSVs
 - Compute Win + C3 score curve Z(t)
 - Peak picking + min distance + min segment length
-- NEW segmentation conversion:
-    "event windows around peaks + background segments" (full coverage, non-overlapping)
-    - For each peak, find closest local minimum (valley) on left/right of the peak on the Z-grid
-    - Make an event window [valley_left, valley_right]
+- Segmentation conversion (full coverage, non-overlapping):
+    "event windows around peaks + background segments"
+    - For each peak, find closest local minimum (valley) on the left/right of the peak on the Z-grid
+    - Create an event window [valley_left, valley_right]
     - Merge overlapping/nearby event windows (also merge if gap < min_segment_len_s)
-    - Add background segments from gaps between event windows
+    - Add background segments for the gaps between event windows
     - Edge cases: clip to [0, T]
-- Compute PI vector (258) per segment
+- Compute PI vector per segment (expects 258 fullnames from your Excel)
 - Save cached file per student (.npz)
 
 Expected directory structure (root_dir):
   {date}/{client_id}/{test_type}/eye-tracking/{other_id}/eye-tracking.csv
-
-Labels CSV:
-  /data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv
 
 PI extractor is fixed at:
   /data_248/pdss/primitive_indicator_scripts/scripts/intern/extract_eye_tracking_pi_window.py
 
 Usage example:
   python preprocess.py \
-  --root_dir "/data_248/pdss/hospital_data_real" \
-  --label_csv "/data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv" \
-  --test_type dnb \
-  --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/valley_dnb" \
-  --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/Primitive Indicator Lists_filtered.xlsx" \
-  --pi_sheet "eye-tracking" \
-  --screen_w 1920 \
-  --screen_h 1080 \
-  --half_window_s 2.5 \
-  --step_s 1.0 \
-  --min_cp_distance_s 0.1 \
-  --min_segment_len_s 0.1 \
-  --min_valid_points 10 \
-  --overwrite
-
+    --root_dir "/data_248/pdss/hospital_data_real" \
+    --label_csv "/data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv" \
+    --test_type dnb \
+    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/valley_dnb2" \
+    --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/Primitive Indicator Lists_filtered.xlsx" \
+    --pi_sheet "eye-tracking" \
+    --half_window_s 4 \
+    --step_s 1.0 \
+    --min_cp_distance_s 1 \
+    --min_segment_len_s 0.1 \
+    --min_valid_points 5 \
+    --overwrite \
+    --debug
 """
 
 import argparse
@@ -85,8 +80,7 @@ TEST_TYPE_DEFAULT = "vst"
 # -----------------------------
 # Missing-data policy knobs
 # -----------------------------
-MIN_STUDENT_VALID_RATIO = 0.80  # not used for dropping whole student here (kept for compatibility)
-MIN_VALID_POINTS = 10           # skip windows/segments if too few valid samples
+MIN_VALID_POINTS = 10  # skip windows/segments if too few valid samples
 
 
 # -----------------------------
@@ -117,8 +111,50 @@ def robust_mad(x: np.ndarray) -> float:
     return float(np.median(np.abs(x - med)) + 1e-12)
 
 
+def dprint(debug: bool, msg: str) -> None:
+    if debug:
+        print(msg)
+
+
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def summarize_arr(x: np.ndarray, name: str, max_head: int = 10) -> dict:
+    """Small numeric summary for debug logging."""
+    x = np.asarray(x)
+    out = {"name": name, "shape": list(x.shape), "dtype": str(x.dtype), "n": int(x.size)}
+    if x.size == 0:
+        return out
+    if np.issubdtype(x.dtype, np.number):
+        xf = x[np.isfinite(x)]
+        out["finite_n"] = int(xf.size)
+        if xf.size:
+            out.update(
+                {
+                    "min": float(np.min(xf)),
+                    "max": float(np.max(xf)),
+                    "mean": float(np.mean(xf)),
+                    "median": float(np.median(xf)),
+                    "p90": float(np.percentile(xf, 90)),
+                }
+            )
+    try:
+        out["head"] = [float(v) for v in x.flatten()[:max_head]]
+    except Exception:
+        out["head"] = [str(v) for v in x.flatten()[:max_head]]
+    return out
+
+
+def write_debug_json(path: Path, payload: dict, debug: bool) -> None:
+    if not debug:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[DBG] failed to write debug json to {path}: {e}", file=sys.stderr)
 
 
 def load_pi_module(pi_py_path: str):
@@ -128,7 +164,7 @@ def load_pi_module(pi_py_path: str):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load PI module spec from: {pi_py_path}")
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod  # register before exec (dataclass)
+    sys.modules[spec.name] = mod  # register before exec (dataclass safety)
     spec.loader.exec_module(mod)
     return mod
 
@@ -301,17 +337,14 @@ def compute_Z_scores(t_s: np.ndarray, XY: np.ndarray, cfg: SegConfig) -> Tuple[n
 
 def estimate_beta_from_Z(Z: np.ndarray) -> float:
     """
-    Less aggressive adaptive beta than before to avoid "no peaks found" collapse.
-
-    Old behavior was typically too strict (e.g., 85th percentile).
-    New behavior:
+    Slightly relaxed adaptive beta:
       beta = max(median(Z) + 0.5*MAD(Z), percentile(Z, 70), 0)
     """
     Zf = Z[np.isfinite(Z)]
     if Zf.size == 0:
         return 0.0
     med = float(np.median(Zf))
-    mad = robust_mad(Zf)  # already includes tiny epsilon
+    mad = robust_mad(Zf)
     beta1 = med + 0.5 * mad
     beta2 = float(np.percentile(Zf, 70))
     return float(max(beta1, beta2, 0.0))
@@ -329,7 +362,7 @@ def pick_peaks_greedy(
       - candidate peaks: local maxima (optional) and Z >= beta
       - enforce min distance by greedy selection in descending Z
 
-    Fix: relax local-maxima check to allow plateaus:
+    Relaxed peak condition (plateaus allowed):
       Z[i] >= left and Z[i] >= right
     """
     centers_s = np.asarray(centers_s, dtype=float)
@@ -347,7 +380,6 @@ def pick_peaks_greedy(
         if local_maxima_only:
             left = Z[i - 1] if i - 1 >= 0 else -np.inf
             right = Z[i + 1] if i + 1 < Z.size else -np.inf
-            # relaxed peak condition
             if not (Z[i] >= left and Z[i] >= right):
                 continue
         candidates.append(i)
@@ -369,7 +401,7 @@ def pick_peaks_greedy(
 
 
 # -----------------------------
-# NEW: event windows around peaks + background segments
+# Event windows around peaks + background segments
 # -----------------------------
 def _local_minima_indices(Z: np.ndarray) -> np.ndarray:
     """
@@ -386,21 +418,16 @@ def _local_minima_indices(Z: np.ndarray) -> np.ndarray:
         return np.array([], dtype=int)
 
     mins = []
-
-    # include first/last finite indices as minima candidates
     mins.append(int(finite_idx[0]))
     mins.append(int(finite_idx[-1]))
 
     if finite_idx.size < 3:
         return np.array(sorted(set(mins)), dtype=int)
 
-    # check local minima among finite indices
     for k in range(1, finite_idx.size - 1):
         i = int(finite_idx[k])
         il = int(finite_idx[k - 1])
         ir = int(finite_idx[k + 1])
-
-        # local minimum (allow equal)
         if Z[i] <= Z[il] and Z[i] <= Z[ir]:
             mins.append(i)
 
@@ -408,16 +435,14 @@ def _local_minima_indices(Z: np.ndarray) -> np.ndarray:
 
 
 def _merge_intervals(intervals: List[Tuple[float, float]], merge_gap_s: float) -> List[Tuple[float, float]]:
-    """
-    Merge overlapping intervals and also merge if gap < merge_gap_s (to avoid tiny background segments).
-    """
+    """Merge overlapping intervals and also merge if gap < merge_gap_s."""
     if not intervals:
         return []
     intervals = sorted(intervals, key=lambda x: (x[0], x[1]))
     merged = [intervals[0]]
     for a, b in intervals[1:]:
         a0, b0 = merged[-1]
-        if a <= b0 or (a - b0) < merge_gap_s:
+        if a < b0 or (a - b0) < merge_gap_s:
             merged[-1] = (float(a0), float(max(b0, b)))
         else:
             merged.append((float(a), float(b)))
@@ -430,10 +455,11 @@ def build_segments_event_background(
     peaks_s: List[float],
     T_end_s: float,
     min_seg_len_s: float,
+    debug: bool = False,
 ) -> List[Tuple[float, float]]:
     """
     Full coverage non-overlapping segmentation:
-      1) for each peak: event window [valley_left, valley_right] (closest local minima around the peak on Z-grid)
+      1) for each peak: event window [valley_left, valley_right]
       2) merge overlaps and merge close intervals if gap < min_seg_len_s
       3) background segments are gaps between event windows
       4) clip to [0, T_end_s]
@@ -447,79 +473,80 @@ def build_segments_event_background(
     Z = np.asarray(Z, dtype=float)
 
     if centers_s.size == 0 or Z.size == 0 or not peaks_s:
-        # No peaks -> one background segment (whole recording)
+        dprint(debug, f"[DBG] fallback: no peaks or empty Z/centers -> 1 segment [{start0:.2f},{endT:.2f}]")
         return [(start0, endT)] if (endT - start0) >= min_seg_len_s else []
 
     mins = _local_minima_indices(Z)
-    # If no minima found, just use whole recording as one segment
+    dprint(debug, f"[DBG] local minima count={mins.size}")
+    if mins.size > 0:
+        dprint(debug, f"[DBG] minima times (first 10): {[float(centers_s[i]) for i in mins[:10]]}")
+
     if mins.size == 0:
+        dprint(debug, "[DBG] fallback: no minima -> 1 segment whole recording")
         return [(start0, endT)] if (endT - start0) >= min_seg_len_s else []
 
-    # Build event intervals around each peak
     event_intervals: List[Tuple[float, float]] = []
     for p in peaks_s:
-        # nearest index on grid
         idx = int(np.argmin(np.abs(centers_s - float(p))))
-
         left_candidates = mins[mins < idx]
         right_candidates = mins[mins > idx]
 
         left_t = start0
         right_t = endT
-
         if left_candidates.size > 0:
             left_t = float(centers_s[int(left_candidates[-1])])
         if right_candidates.size > 0:
             right_t = float(centers_s[int(right_candidates[0])])
 
-        # clip
         left_t = max(start0, min(left_t, endT))
         right_t = max(start0, min(right_t, endT))
-
         if right_t < left_t:
             left_t, right_t = right_t, left_t
 
         if (right_t - left_t) >= min_seg_len_s:
             event_intervals.append((left_t, right_t))
 
-    # Merge overlaps and also merge close ones (tiny gaps)
-    merged_events = _merge_intervals(event_intervals, merge_gap_s=min_seg_len_s)
+    dprint(debug, f"[DBG] raw event_intervals={len(event_intervals)}")
+    if event_intervals[:5]:
+        dprint(debug, f"[DBG] first 5 event_intervals={event_intervals[:5]}")
 
-    # Build background segments as gaps (full coverage)
+    merged_events = _merge_intervals(event_intervals, merge_gap_s=min_seg_len_s)
+    dprint(debug, f"[DBG] merged_events={len(merged_events)}")
+    if merged_events[:5]:
+        dprint(debug, f"[DBG] first 5 merged_events={merged_events[:5]}")
+
     segments: List[Tuple[float, float]] = []
     cur = start0
+
     for (ea, eb) in merged_events:
         ea = max(start0, min(float(ea), endT))
         eb = max(start0, min(float(eb), endT))
         if eb < ea:
             ea, eb = eb, ea
 
-        # background gap
         gap = ea - cur
         if gap >= min_seg_len_s:
             segments.append((float(cur), float(ea)))
+            cur = ea
         elif gap > 0:
-            # tiny gap: merge into event by extending event start backwards
+            # tiny gap: swallow into event by moving event start backward
             ea = float(cur)
 
-        # event
         if (eb - ea) >= min_seg_len_s:
             segments.append((float(ea), float(eb)))
-            cur = float(eb)
+            cur = eb
         else:
-            # too short event -> skip (rare after merge); keep cur unchanged
-            pass
+            # tiny event -> ignore
+            cur = max(cur, eb)
 
-    # tail background
-    tail = endT - cur
-    if tail >= min_seg_len_s:
+    if (endT - cur) >= min_seg_len_s:
         segments.append((float(cur), float(endT)))
-    elif tail > 0 and segments:
-        # tiny tail: extend last segment to end
+    elif (endT - cur) > 0 and segments:
+        # swallow trailing tiny remainder into last segment
         a0, _b0 = segments[-1]
         segments[-1] = (float(a0), float(endT))
 
-    # Ensure sorted, non-overlapping, and min length
+    # Ensure sorted, non-overlapping, min length, and merge tiny gaps again
     out: List[Tuple[float, float]] = []
     for a, b in sorted(segments, key=lambda x: (x[0], x[1])):
         if (b - a) < min_seg_len_s:
@@ -528,10 +555,15 @@ def build_segments_event_background(
             out.append((a, b))
         else:
             pa, pb = out[-1]
-            if a <= pb or (a - pb) < min_seg_len_s:
+            if a < pb:
                 out[-1] = (pa, max(pb, b))
             else:
                 out.append((a, b))
+
+    if not out:
+        dprint(debug, "[DBG] WARNING: build_segments produced empty -> fallback whole recording")
+        return [(start0, endT)] if (endT - start0) >= min_seg_len_s else []
+
     return out
 
 
@@ -590,6 +622,8 @@ def process_one_eyetracking_file(
     cfg: SegConfig,
     screen_w: float,
     screen_h: float,
+    debug: bool = False,
+    debug_json_path: Optional[Path] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Returns:
@@ -600,7 +634,6 @@ def process_one_eyetracking_file(
     """
     df_raw = pd.read_csv(csv_path)
 
-    # clean (drop invalid rows)
     df, _n_valid, _n_total = normalize_columns_with_valid_ratio(df_raw)
     if df.empty:
         X = np.zeros((0, len(fullnames)), dtype=float)
@@ -611,7 +644,21 @@ def process_one_eyetracking_file(
     XY = df[["x", "y"]].to_numpy(dtype=float)
 
     centers_s, Z = compute_Z_scores(t_s=t_s, XY=XY, cfg=cfg)
+
+    if debug:
+        dprint(True, f"[DBG] file={csv_path}")
+        dprint(True, f"[DBG] n_valid_samples={len(df)}  T_end_s={float(t_s[-1]) if t_s.size else 0.0:.4f}")
+        if t_s.size >= 2:
+            dt = np.diff(t_s)
+            dt = dt[np.isfinite(dt) & (dt > 0)]
+            if dt.size:
+                dprint(True, f"[DBG] dt_s: median={float(np.median(dt)):.6f}  p10={float(np.percentile(dt,10)):.6f}  p90={float(np.percentile(dt,90)):.6f}")
+        dprint(True, f"[DBG] centers_s: n={centers_s.size}  step_s={cfg.step_s}  half_window_s={cfg.half_window_s}")
+        dprint(True, f"[DBG] Z summary: {summarize_arr(Z, 'Z')}  finite_ratio={float(np.isfinite(Z).mean()) if Z.size else 0.0:.3f}")
+
     beta_used = cfg.beta if cfg.beta is not None else estimate_beta_from_Z(Z)
+    if debug:
+        dprint(True, f"[DBG] beta_used={beta_used:.6f} (cfg.beta={'fixed' if cfg.beta is not None else 'adaptive'})")
 
     peaks_s = pick_peaks_greedy(
         centers_s=centers_s,
@@ -621,7 +668,14 @@ def process_one_eyetracking_file(
         local_maxima_only=bool(cfg.local_maxima_only),
     )
 
-    # NEW segmentation conversion (full coverage): event windows + background gaps
+    if debug:
+        dprint(True, f"[DBG] peaks: n={len(peaks_s)}  min_cp_distance_s={cfg.min_cp_distance_s}")
+        if peaks_s[:10]:
+            dprint(True, f"[DBG] peaks_s (first 10)={peaks_s[:10]}")
+        if Z.size:
+            above = int(np.sum(np.isfinite(Z) & (Z >= float(beta_used))))
+            dprint(True, f"[DBG] Z>=beta count={above} / {Z.size}")
+
     T_end_s = float(t_s[-1]) if t_s.size else 0.0
     segments = build_segments_event_background(
         centers_s=centers_s,
@@ -629,7 +683,31 @@ def process_one_eyetracking_file(
         peaks_s=peaks_s,
         T_end_s=T_end_s,
         min_seg_len_s=float(cfg.min_segment_len_s),
+        debug=debug,
     )
+
+    if debug:
+        dprint(True, f"[DBG] segments built: n={len(segments)}  min_segment_len_s={cfg.min_segment_len_s}")
+        if segments[:10]:
+            dprint(True, f"[DBG] segments (first 10)={segments[:10]}")
+        if len(segments) == 1:
+            dprint(True, "[DBG] WARNING: only 1 segment -> likely (a) no peaks passed threshold, (b) minima detection collapsed, or (c) Z mostly NaN")
+
+        if debug_json_path is not None:
+            payload = {
+                "file": str(csv_path),
+                "n_valid_samples": int(len(df)),
+                "T_end_s": float(T_end_s),
+                "beta_used": float(beta_used),
+                "cfg": cfg.__dict__,
+                "centers_s": summarize_arr(centers_s, "centers_s"),
+                "Z": summarize_arr(Z, "Z"),
+                "n_peaks": int(len(peaks_s)),
+                "peaks_s_first10": [float(x) for x in peaks_s[:10]],
+                "n_segments": int(len(segments)),
+                "segments_first10": [(float(a), float(b)) for (a, b) in segments[:10]],
+            }
+            write_debug_json(Path(debug_json_path), payload, debug=True)
 
     feats: List[np.ndarray] = []
     seg_starts: List[float] = []
@@ -679,7 +757,7 @@ def parse_args() -> argparse.Namespace:
                     help="Output cache directory for per-student .npz files")
 
     ap.add_argument("--pi_excel", type=str, required=True,
-                    help='Excel file path containing PI list (258 fullnames).')
+                    help="Excel file path containing PI fullnames (target: 258).")
     ap.add_argument("--pi_sheet", type=str, default="eye-tracking",
                     help="Sheet name in the PI excel file (default: eye-tracking)")
 
@@ -703,6 +781,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--overwrite", action="store_true",
                     help="Overwrite existing cached .npz")
 
+    ap.add_argument("--debug", action="store_true",
+                    help="Verbose debug prints + write per-file debug JSONs.")
+    ap.add_argument("--debug_dir", type=str, default=None,
+                    help="Where to write debug JSONs (default: <out_dir>/debug)")
+    ap.add_argument("--debug_max_print", type=int, default=3,
+                    help="Max number of eye-tracking files per student to write debug JSON for (default: 3)")
+
     return ap.parse_args()
 
 
@@ -713,6 +798,10 @@ def main() -> None:
     label_csv = Path(args.label_csv)
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
+
+    debug_dir = Path(args.debug_dir) if args.debug_dir else (out_dir / "debug")
+    if args.debug:
+        ensure_dir(debug_dir)
 
     if not root_dir.exists():
         raise FileNotFoundError(f"root_dir not found: {root_dir}")
@@ -772,8 +861,8 @@ def main() -> None:
         "avg_segments": None,
         "beta_stats": {},
     }
-    seg_counts = []
-    betas = []
+    seg_counts: List[int] = []
+    betas: List[float] = []
 
     for r in tqdm(rows, desc="clients"):
         client_id = str(r["client_id"])
@@ -781,6 +870,9 @@ def main() -> None:
         y = int(r["y"])
 
         out_file = out_dir / f"{client_id}_{test_type}.npz"
+        if args.debug:
+            dprint(True, f"\n[DBG] ===== client_id={client_id} y={y} label={group_label} =====")
+
         if out_file.exists() and not args.overwrite:
             summary["n_cached"] += 1
             continue
@@ -797,6 +889,10 @@ def main() -> None:
 
         try:
             for f in files:
+                dbg_path = None
+                if args.debug and (len(file_meta) < int(args.debug_max_print)):
+                    dbg_path = debug_dir / f"{client_id}_{test_type}__file{len(file_meta)+1}.json"
+
                 X, ss, ee, beta_used = process_one_eyetracking_file(
                     csv_path=f,
                     pi_mod=pi_mod,
@@ -804,6 +900,8 @@ def main() -> None:
                     cfg=cfg,
                     screen_w=float(args.screen_w),
                     screen_h=float(args.screen_h),
+                    debug=bool(args.debug),
+                    debug_json_path=dbg_path,
                 )
                 if X.shape[0] == 0:
                     continue
@@ -870,6 +968,8 @@ def main() -> None:
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     print(f"Cache dir: {out_dir}")
     print(f"Summary:  {summary_path}")
+    if args.debug:
+        print(f"[DBG] debug JSON dir: {debug_dir}")
 
 
 if __name__ == "__main__":
