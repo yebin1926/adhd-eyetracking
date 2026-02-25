@@ -23,15 +23,14 @@ Notes:
 
 Running Example:
     python train.py \
-    --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/ast_filtered" \
-    --test_type ast \
-    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial25_ast_bal" \
+    --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/valley_vst" \
+    --test_type vst \
+    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial32_valley_vst" \
     --batch_size 16 \
     --epochs 100 \
     --patience 15 \
     --lr 3e-4 \
     --weight_decay 1e-2 \
-    --num_workers 4 \
     --device cpu
 
 CHANGED (minimal):

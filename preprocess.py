@@ -27,7 +27,7 @@ Usage example:
     --root_dir "/data_248/pdss/hospital_data_real" \
     --label_csv "/data_248/pdss/primitive_indicator_scripts/scripts/test_se/client_demographics.csv" \
     --test_type dnb \
-    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/valley_dnb2" \
+    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/valley_ast" \
     --pi_excel "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/Primitive Indicator Lists_filtered.xlsx" \
     --pi_sheet "eye-tracking" \
     --half_window_s 4 \
