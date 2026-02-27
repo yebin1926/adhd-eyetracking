@@ -23,9 +23,9 @@ Notes:
 
 Running Example:
     python train.py \
-    --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/valley_vst" \
-    --test_type vst \
-    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial32_valley_vst" \
+    --cache_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/preprocessed_output/valley_ast" \
+    --test_type ast \
+    --out_dir "/data_248/pdss/primitive_indicator_scripts/scripts/intern/dynamic_segmentation/results/trial35_valley_ast" \
     --batch_size 16 \
     --epochs 100 \
     --patience 15 \
